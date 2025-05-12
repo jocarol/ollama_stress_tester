@@ -43,7 +43,7 @@ log_file = open("stress_debug.log", "w")
 console = Console()
 
 def send_prompt(user_id, prompt):
-    """Send a streaming prompt to the model, update active_requests with ongoing response, and return the full response and response time."""
+    """Send a streaming prompt to the model, update active_requests, and return response and time."""
     payload = {
         "model": MODEL_NAME,
         "prompt": prompt,
@@ -73,35 +73,62 @@ def send_prompt(user_id, prompt):
                     except json.JSONDecodeError:
                         log_file.write(f"Invalid JSON in response line: {line}\n")
                         log_file.flush()
-        end_time = time.time()
-        duration = end_time - start_time
-        log_file.write(f"Request for user {user_id} completed in {duration:.2f} seconds with {chunk_count} chunks. Full response: {accumulated_text}\n")
+        duration = time.time() - start_time
+        log_file.write(f"Request for user {user_id} completed in {duration:.2f} seconds with {chunk_count} chunks. Response: {accumulated_text}\n")
         log_file.flush()
         return accumulated_text, duration
     except requests.exceptions.Timeout:
         log_file.write(f"Request for user {user_id} timed out after 600 seconds\n")
         log_file.flush()
-        with lock:
-            if user_id in active_requests:
-                user_type = active_requests[user_id][0]
-                logs.append({
-                    "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    "user_id": f"{user_type} {user_id}",
-                    "action": "Request timed out"
-                })
         return "Timeout", 600
     except Exception as e:
         log_file.write(f"Error during request for user {user_id}: {e}\n")
         log_file.flush()
-        with lock:
-            if user_id in active_requests:
-                user_type = active_requests[user_id][0]
+        return "Error", 0
+
+def perform_action(user_id, user_type, action, prompt, parse_response=None):
+    """Helper function to perform an action, send prompt, and log results."""
+    with lock:
+        active_requests[user_id] = [user_type, action, ""]
+    try:
+        response, rt = send_prompt(user_id, prompt)
+        response = response.strip()
+        if response in ["Timeout", "Error"]:
+            with lock:
                 logs.append({
                     "timestamp": datetime.now().strftime("%H:%M:%S"),
                     "user_id": f"{user_type} {user_id}",
-                    "action": f"Request failed: {str(e)}"
+                    "action": f"{action} failed: {response}"
                 })
-        return "Error", 0
+            return rt, None
+        parsed = parse_response(response) if parse_response else None
+        if parse_response:
+            if parsed:
+                with lock:
+                    logs.append({
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "user_id": f"{user_type} {user_id}",
+                        "action": f"{action}: {parsed}"
+                    })
+            else:
+                with lock:
+                    logs.append({
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "user_id": f"{user_type} {user_id}",
+                        "action": f"{action} failed: Response unexpected. Got: '{response}'"
+                    })
+        else:
+            with lock:
+                logs.append({
+                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "user_id": f"{user_type} {user_id}",
+                    "action": action
+                })
+        return rt, parsed
+    finally:
+        with lock:
+            if user_id in active_requests:
+                del active_requests[user_id]
 
 class Customer:
     def __init__(self, user_id):
@@ -109,61 +136,26 @@ class Customer:
         self.order_id = None
 
     def place_order(self):
+        def parse_order_response(response):
+            match = re.search(r"Votre numéro de commande est (\d+)", response)
+            return match.group(1) if match else None
+        rt, order_id = perform_action(self.user_id, "Customer", "Placed order", 
+                                      "En tant que client, je veux passer une commande pour une pizza.", 
+                                      parse_order_response)
+        if order_id:
+            self.order_id = order_id
         with lock:
-            active_requests[self.user_id] = ["Customer", "Placing Order", ""]
-        try:
-            prompt = "En tant que client, je veux passer une commande pour une pizza."
-            response, rt = send_prompt(self.user_id, prompt)
-            response = response.strip()
-            log_file.write(f"--- Raw response for Customer {self.user_id}: '{response}' ---\n")
-            log_file.flush()
-            match = re.search(r"Votre numéro de commande est (\d+).", response)
-            if match:
-                self.order_id = match.group(1)
-                with lock:
-                    logs.append({
-                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                        "user_id": f"Customer {self.user_id}",
-                        "action": f"Placed order {self.order_id}"
-                    })
-            else:
-                with lock:
-                    logs.append({
-                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                        "user_id": f"Customer {self.user_id}",
-                        "action": f"Failed to place order: Response did not match expected format. Got: '{response}'"
-                    })
-            with lock:
-                customer_response_times.append(rt)
-            return rt
-        finally:
-            with lock:
-                if self.user_id in active_requests:
-                    del active_requests[self.user_id]
+            customer_response_times.append(rt)
+        return rt
 
     def check_status(self):
-        if self.order_id is None:
+        if not self.order_id:
             return 0
+        prompt = f"En tant que client, où en est ma commande {self.order_id} ?"
+        rt, _ = perform_action(self.user_id, "Customer", f"Checked status of order {self.order_id}", prompt)
         with lock:
-            active_requests[self.user_id] = ["Customer", "Checking Status", ""]
-        try:
-            prompt = f"En tant que client, où en est ma commande {self.order_id} ?"
-            response, rt = send_prompt(self.user_id, prompt)
-            response = response.strip()
-            log_file.write(f"--- Raw response for Customer {self.user_id}: '{response}' ---\n")
-            log_file.flush()
-            with lock:
-                customer_response_times.append(rt)
-                logs.append({
-                    "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    "user_id": f"Customer {self.user_id}",
-                    "action": f"Checked status of order {self.order_id}"
-                })
-            return rt
-        finally:
-            with lock:
-                if self.user_id in active_requests:
-                    del active_requests[self.user_id]
+            customer_response_times.append(rt)
+        return rt
 
 class DeliveryPersonnel:
     def __init__(self, user_id):
@@ -171,114 +163,67 @@ class DeliveryPersonnel:
         self.current_order_id = None
 
     def start_shift(self):
+        rt, _ = perform_action(self.user_id, "Delivery", "Started shift", 
+                               "En tant que livreur, je veux commencer mon quart.")
         with lock:
-            active_requests[self.user_id] = ["Delivery", "Starting Shift", ""]
-        try:
-            prompt = "En tant que livreur, je veux commencer mon quart."
-            response, rt = send_prompt(self.user_id, prompt)
-            response = response.strip()
-            log_file.write(f"--- Raw response for Delivery {self.user_id}: '{response}' ---\n")
-            log_file.flush()
-            with lock:
-                delivery_response_times.append(rt)
-                logs.append({
-                    "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    "user_id": f"Delivery {self.user_id}",
-                    "action": "Started shift"
-                })
-            return rt
-        finally:
-            with lock:
-                if self.user_id in active_requests:
-                    del active_requests[self.user_id]
+            delivery_response_times.append(rt)
+        return rt
 
     def get_next_order(self):
-        with lock:
-            active_requests[self.user_id] = ["Delivery", "Getting Next Order", ""]
-        try:
-            prompt = "En tant que livreur, je suis prêt pour la prochaine commande."
-            response, rt = send_prompt(self.user_id, prompt)
-            response = response.strip()
-            log_file.write(f"--- Raw response for Delivery {self.user_id}: '{response}' ---\n")
-            log_file.flush()
+        def parse_order_response(response):
             match = re.search(r"Vous avez une nouvelle commande\s*:\s*(\d+)", response, re.IGNORECASE)
-            if match:
-                self.current_order_id = match.group(1)
-                with lock:
-                    logs.append({
-                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                        "user_id": f"Delivery {self.user_id}",
-                        "action": f"Got next order {self.current_order_id}"
-                    })
-            else:
-                if "Aucune commande disponible pour le moment." in response:
-                    with lock:
-                        logs.append({
-                            "timestamp": datetime.now().strftime("%H:%M:%S"),
-                            "user_id": f"Delivery {self.user_id}",
-                            "action": "No orders available at the moment"
-                        })
-                else:
-                    with lock:
-                        logs.append({
-                            "timestamp": datetime.now().strftime("%H:%M:%S"),
-                            "user_id": f"Delivery {self.user_id}",
-                            "action": f"Failed to get next order: Response did not match expected format. Got: '{response}'"
-                        })
+            return match.group(1) if match else None
+        rt, order_id = perform_action(self.user_id, "Delivery", "Got next order", 
+                                      "En tant que livreur, je suis prêt pour la prochaine commande.", 
+                                      parse_order_response)
+        if order_id:
+            self.current_order_id = order_id
+        elif "Aucune commande disponible pour le moment." in rt[1] or "":
             with lock:
-                delivery_response_times.append(rt)
-            return rt
-        finally:
-            with lock:
-                if self.user_id in active_requests:
-                    del active_requests[self.user_id]
-
-    def deliver_order(self):
-        if self.current_order_id is None:
-            return 0
-        with lock:
-            active_requests[self.user_id] = ["Delivery", "Delivering Order", ""]
-        try:
-            prompt = f"En tant que livreur, j'ai livré la commande {self.current_order_id}."
-            response, rt = send_prompt(self.user_id, prompt)
-            response = response.strip()
-            log_file.write(f"--- Raw response for Delivery {self.user_id}: '{response}' ---\n")
-            log_file.flush()
-            with lock:
-                delivery_response_times.append(rt)
                 logs.append({
                     "timestamp": datetime.now().strftime("%H:%M:%S"),
                     "user_id": f"Delivery {self.user_id}",
-                    "action": f"Delivered order {self.current_order_id}"
+                    "action": "No orders available at the moment"
                 })
-            self.current_order_id = None
-            return rt
-        finally:
-            with lock:
-                if self.user_id in active_requests:
-                    del active_requests[self.user_id]
+        with lock:
+            delivery_response_times.append(rt)
+        return rt
+
+    def deliver_order(self):
+        if not self.current_order_id:
+            return 0
+        prompt = f"En tant que livreur, j'ai livré la commande {self.current_order_id}."
+        rt, _ = perform_action(self.user_id, "Delivery", f"Delivered order {self.current_order_id}", prompt)
+        self.current_order_id = None
+        with lock:
+            delivery_response_times.append(rt)
+        return rt
 
 def customer_thread(customer):
-    start_time = time.time()
-    while time.time() - start_time < TEST_DURATION:
-        if time.time() - start_time >= TEST_DURATION:
-            break
-        customer.place_order()
+    try:
+        start_time = time.time()
         while time.time() - start_time < TEST_DURATION:
-            if time.time() - start_time >= TEST_DURATION:
-                break
-            customer.check_status()
-            time.sleep(INTERVAL_CUSTOMER)
+            customer.place_order()
+            while time.time() - start_time < TEST_DURATION:
+                customer.check_status()
+                time.sleep(INTERVAL_CUSTOMER)
+    except Exception as e:
+        log_file.write(f"Exception in customer_thread {customer.user_id}: {e}\n")
+        log_file.flush()
 
 def delivery_thread(dp):
-    dp.start_shift()
-    start_time = time.time()
-    while time.time() - start_time < TEST_DURATION:
-        dp.get_next_order()
-        if dp.current_order_id:
-            time.sleep(5)
-            dp.deliver_order()
-        time.sleep(INTERVAL_DELIVERY)
+    try:
+        dp.start_shift()
+        start_time = time.time()
+        while time.time() - start_time < TEST_DURATION:
+            dp.get_next_order()
+            if dp.current_order_id:
+                time.sleep(5)
+                dp.deliver_order()
+            time.sleep(INTERVAL_DELIVERY)
+    except Exception as e:
+        log_file.write(f"Exception in delivery_thread {dp.user_id}: {e}\n")
+        log_file.flush()
 
 def monitor_resources():
     end_time = time.time() + TEST_DURATION
@@ -297,33 +242,26 @@ def monitor_tokens():
         time.sleep(1)
         with token_lock:
             current_total = total_tokens
-        tokens_in_last_second = current_total - last_total
+        tokens_per_second = current_total - last_total
         last_total = current_total
-        tokens_per_second = tokens_in_last_second
-        log_file.write(f"Tokens in last second: {tokens_in_last_second}, Total tokens: {current_total}\n")
-        log_file.flush()
 
 def generate_metrics_table():
     with lock:
-        customer_actions = len(customer_response_times)
-        delivery_actions = len(delivery_response_times)
-        avg_customer_rt = statistics.mean(customer_response_times) if customer_response_times else 0
-        avg_delivery_rt = statistics.mean(delivery_response_times) if delivery_response_times else 0
-        current_active = len(active_requests)
-        cu = cpu_usages[-1] if cpu_usages else 0
-        mu = memory_usages[-1] if memory_usages else 0
+        metrics = {
+            "Customer Actions": len(customer_response_times),
+            "Avg Customer RT": f"{statistics.mean(customer_response_times):.2f} s" if customer_response_times else "0.00 s",
+            "Delivery Actions": len(delivery_response_times),
+            "Avg Delivery RT": f"{statistics.mean(delivery_response_times):.2f} s" if delivery_response_times else "0.00 s",
+            "Active Requests": len(active_requests),
+            "CPU Usage": f"{cpu_usages[-1]:.2f}%" if cpu_usages else "0.00%",
+            "Memory Usage": f"{memory_usages[-1]:.2f}%" if memory_usages else "0.00%",
+            "Tokens Per Second": tokens_per_second
+        }
     table = Table(show_header=False, box=box.MINIMAL)
     table.add_column(style="cyan")
     table.add_column(style="magenta")
-    table.add_row("Customer Actions", str(customer_actions))
-    table.add_row("Avg Customer RT", f"{avg_customer_rt:.2f} s")
-    table.add_row("Delivery Actions", str(delivery_actions))
-    table.add_row("Avg Delivery RT", f"{avg_delivery_rt:.2f} s")
-    table.add_row("Active Requests", str(current_active))
-    table.add_row("Queued Requests", str(current_active))
-    table.add_row("CPU Usage", f"{cu:.2f}%")
-    table.add_row("Memory Usage", f"{mu:.2f}%")
-    table.add_row("Tokens Per Second", str(tokens_per_second))
+    for key, value in metrics.items():
+        table.add_row(key, str(value))
     return table
 
 def generate_active_requests_table():
@@ -335,13 +273,10 @@ def generate_active_requests_table():
         table.add_column("Action", style="white", width=15, overflow="fold")
         table.add_column("Response", style="green", overflow="fold")
         for user_id, [user_type, action, response_text] in requests:
-            user_str = f"{user_type} {user_id}"
-            action_str = action
-            response_str = response_text
-            table.add_row(user_str, action_str, response_str)
+            response_str = response_text[-100:] if len(response_text) > 100 else response_text
+            table.add_row(f"{user_type} {user_id}", action, response_str)
         return table
-    else:
-        return Text("No active requests", style="yellow")
+    return Text("No active requests", style="yellow")
 
 def generate_logs_table(max_rows):
     with lock:
@@ -357,23 +292,18 @@ def generate_logs_table(max_rows):
 if __name__ == "__main__":
     customers = [Customer(i) for i in range(1, NUM_CUSTOMERS + 1)]
     delivery_personnel = [DeliveryPersonnel(i) for i in range(11, 11 + NUM_DELIVERY)]
-    resource_monitor = threading.Thread(target=monitor_resources)
-    token_monitor = threading.Thread(target=monitor_tokens)
-    resource_monitor.start()
-    token_monitor.start()
-    customer_threads = []
-    for customer in customers:
-        t = threading.Thread(target=customer_thread, args=(customer,))
+    threads = [
+        threading.Thread(target=monitor_resources),
+        threading.Thread(target=monitor_tokens)
+    ] + [threading.Thread(target=customer_thread, args=(c,)) for c in customers] + \
+      [threading.Thread(target=delivery_thread, args=(dp,)) for dp in delivery_personnel]
+    
+    for t in threads:
         t.start()
-        customer_threads.append(t)
-    delivery_threads = []
-    for dp in delivery_personnel:
-        t = threading.Thread(target=delivery_thread, args=(dp,))
-        t.start()
-        delivery_threads.append(t)
+
     layout = Layout()
     layout.split_column(
-    Layout(name="header", size=12),
+        Layout(name="header", size=12),
         Layout(name="main", ratio=1),
         Layout(name="progress", size=3)
     )
@@ -389,58 +319,36 @@ if __name__ == "__main__":
     task = progress.add_task("Test progress", total=TEST_DURATION)
     config_text = Text(justify="center")
     config_text.append("OLLAMA STRESS TESTER\n\n", style="bold magenta")
-    config_text.append("Model: ", style="bold cyan")
-    config_text.append(f"{MODEL_NAME}\n", style="green")
-    config_text.append("Ollama URL: ", style="bold cyan")
-    config_text.append(f"{OLLAMA_URL}\n", style="green")
-    config_text.append("Number of Customers: ", style="bold cyan")
-    config_text.append(f"{NUM_CUSTOMERS}\n", style="green")
-    config_text.append("Number of Delivery Personnel: ", style="bold cyan")
-    config_text.append(f"{NUM_DELIVERY}\n", style="green")
-    config_text.append("Test Duration: ", style="bold cyan")
-    config_text.append(f"{TEST_DURATION} seconds\n", style="green")
-    config_text.append("Customer Interval: ", style="bold cyan")
-    config_text.append(f"{INTERVAL_CUSTOMER} seconds\n", style="green")
-    config_text.append("Delivery Interval: ", style="bold cyan")
-    config_text.append(f"{INTERVAL_DELIVERY} seconds\n", style="green")
+    config_text.append(f"Model: {MODEL_NAME}\nOllama URL: {OLLAMA_URL}\n")
+    config_text.append(f"Customers: {NUM_CUSTOMERS}\nDelivery Personnel: {NUM_DELIVERY}\n")
+    config_text.append(f"Duration: {TEST_DURATION}s\nCustomer Interval: {INTERVAL_CUSTOMER}s\nDelivery Interval: {INTERVAL_DELIVERY}s\n")
     title_panel = Panel(config_text, border_style="bright_blue")
+
     with Live(layout, refresh_per_second=1, console=console):
         start_time = time.time()
         while time.time() - start_time < TEST_DURATION:
             layout["header"].update(title_panel)
-            metrics_table = generate_metrics_table()
-            active_table = generate_active_requests_table()  # Define active_table here
-            term_height = console.size.height
-            max_rows = max(1, term_height - 20)
-            logs_table = generate_logs_table(max_rows)
-            layout["metrics"].update(Panel(metrics_table, title="Metrics", border_style="green"))
-            layout["active_requests"].update(Panel(active_table, title="Active Requests", border_style="blue", padding=0))
-            layout["logs"].update(Panel(logs_table, title="Logs", border_style="yellow"))
-            elapsed = time.time() - start_time
-            progress.update(task, completed=elapsed)
+            layout["metrics"].update(Panel(generate_metrics_table(), title="Metrics", border_style="green"))
+            layout["active_requests"].update(Panel(generate_active_requests_table(), title="Active Requests", border_style="blue"))
+            layout["logs"].update(Panel(generate_logs_table(console.size.height - 20), title="Logs", border_style="yellow"))
+            progress.update(task, completed=time.time() - start_time)
             layout["progress"].update(progress)
             time.sleep(1)
-    for t in customer_threads + delivery_threads + [resource_monitor, token_monitor]:
+
+    for t in threads:
         t.join()
-    avg_customer_rt = statistics.mean(customer_response_times) if customer_response_times else 0
-    max_customer_rt = max(customer_response_times) if customer_response_times else 0
-    avg_delivery_rt = statistics.mean(delivery_response_times) if delivery_response_times else 0
-    max_delivery_rt = max(delivery_response_times) if delivery_response_times else 0
-    avg_cpu = statistics.mean(cpu_usages) if cpu_usages else 0
-    max_cpu = max(cpu_usages) if cpu_usages else 0
-    avg_memory = statistics.mean(memory_usages) if memory_usages else 0
-    max_memory = max(memory_usages) if memory_usages else 0
+
     print("Rapport de Test de Charge LLM")
     print("-----------------------------")
     print(f"Nombre de clients simulés : {NUM_CUSTOMERS}")
     print(f"Nombre de livreurs simulés : {NUM_DELIVERY}")
     print(f"Durée du test : {TEST_DURATION} secondes")
-    print(f"Temps de réponse moyen des clients : {avg_customer_rt:.2f} s")
-    print(f"Temps de réponse maximal des clients : {max_customer_rt:.2f} s")
-    print(f"Temps de réponse moyen des livreurs : {avg_delivery_rt:.2f} s")
-    print(f"Temps de réponse maximal des livreurs : {max_delivery_rt:.2f} s")
-    print(f"Utilisation moyenne du CPU : {avg_cpu:.2f}%")
-    print(f"Utilisation maximale du CPU : {max_cpu:.2f}%")
-    print(f"Utilisation moyenne de la mémoire : {avg_memory:.2f}%")
-    print(f"Utilisation maximale de la mémoire : {max_memory:.2f}%")
+    print(f"Temps de réponse moyen des clients : {statistics.mean(customer_response_times):.2f} s" if customer_response_times else "0.00 s")
+    print(f"Temps de réponse maximal des clients : {max(customer_response_times):.2f} s" if customer_response_times else "0.00 s")
+    print(f"Temps de réponse moyen des livreurs : {statistics.mean(delivery_response_times):.2f} s" if delivery_response_times else "0.00 s")
+    print(f"Temps de réponse maximal des livreurs : {max(delivery_response_times):.2f} s" if delivery_response_times else "0.00 s")
+    print(f"Utilisation moyenne du CPU : {statistics.mean(cpu_usages):.2f}%" if cpu_usages else "0.00%")
+    print(f"Utilisation maximale du CPU : {max(cpu_usages):.2f}%" if cpu_usages else "0.00%")
+    print(f"Utilisation moyenne de la mémoire : {statistics.mean(memory_usages):.2f}%" if memory_usages else "0.00%")
+    print(f"Utilisation maximale de la mémoire : {max(memory_usages):.2f}%" if memory_usages else "0.00%")
     log_file.close()
